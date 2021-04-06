@@ -1,0 +1,231 @@
+---
+defaultBaseImageVersion: latest
+properties:
+- name: IBM_CLOUD_API_KEY
+  value: ${API_KEY}
+  type: secure
+stages:
+- name: BUILD
+  inputs:
+  - type: git
+    branch: master
+    service: ${GIT_REPO}    
+  triggers:
+  - type: commit
+  properties:
+  - name: IMAGE_NAME
+    value: ${APP_NAME}
+    type: text
+  jobs:
+  - name: Fetch code
+    type: builder
+    artifact_dir: ''
+    build_type: shell
+    script: |+
+      #!/bin/bash
+      # set -x
+
+      # Git repo cloned at $WORKING_DIR, copy into $ARCHIVE_DIR
+      mkdir -p $ARCHIVE_DIR
+      cp -R -n ./ $ARCHIVE_DIR/ || true
+
+      # Record git info
+      echo "GIT_URL=${GIT_URL}" >> $ARCHIVE_DIR/build.properties
+      echo "GIT_BRANCH=${GIT_BRANCH}" >> $ARCHIVE_DIR/build.properties
+      echo "GIT_COMMIT=${GIT_COMMIT}" >> $ARCHIVE_DIR/build.properties
+      echo "SOURCE_BUILD_NUMBER=${BUILD_NUMBER}" >> $ARCHIVE_DIR/build.properties
+      # git user and password needed for later job
+      GIT_REMOTE_URL=$( git config --get remote.origin.url )
+      GIT_USER=$( echo ${GIT_REMOTE_URL} | cut -d/ -f3 | cut -d: -f1 )
+      GIT_PASSWORD=$( echo ${GIT_REMOTE_URL} | cut -d: -f3 | cut -d@ -f1 )      
+      echo "GIT_USER=${GIT_USER}" >> $ARCHIVE_DIR/build.properties
+      echo "GIT_PASSWORD=${GIT_PASSWORD}" >> $ARCHIVE_DIR/build.properties
+      cat $ARCHIVE_DIR/build.properties | grep -v -i password
+
+      # check if doi is integrated in this toolchain
+      if jq -e '.services[] | select(.service_id=="draservicebroker")' _toolchain.json; then
+        # Record build information
+        ibmcloud login --apikey ${IBM_CLOUD_API_KEY} --no-region
+        ibmcloud doi publishbuildrecord --branch ${GIT_BRANCH} --repositoryurl ${GIT_URL} --commitid ${GIT_COMMIT} \
+          --buildnumber ${BUILD_NUMBER} --logicalappname ${IMAGE_NAME} --status pass
+      fi
+  - name: Unit Tests
+    type: tester
+    script: |-
+      #!/bin/bash
+      # set -x
+      if [ -f ./test/run-tests.sh ]; then
+        source ./test/run-tests.sh
+        ibmcloud login --apikey $IBM_CLOUD_API_KEY --no-region
+        IFS=';' read -ra locations <<< "$FILE_LOCATIONS"
+        IFS=';' read -ra types <<< "$TEST_TYPES"
+        if jq -e '.services[] | select(.service_id=="draservicebroker")' _toolchain.json; then
+          for i in "${!locations[@]}"
+          do
+            echo "$i ${locations[i]} ${types[i]}"
+            ibmcloud doi publishtestrecord --logicalappname=${IMAGE_NAME} --buildnumber=$BUILD_NUMBER --filelocation=${locations[i]} --type=${types[i]}
+          done
+        fi
+      else
+        echo "Test runner script not found: ./test/run-tests.sh"
+      fi
+- name: CONTAINERIZE
+  properties:
+  - name: buildprops
+    value: build.properties
+    type: file
+  - name: DOCKER_ROOT
+    value: .
+    type: text
+  - name: DOCKER_FILE
+    value: Dockerfile
+    type: text
+  - name: PIPELINE_IMAGE_URL
+    value: undefined
+    type: text
+  inputs:
+  - type: job
+    stage: BUILD
+    job: Fetch code
+  triggers:
+  - type: stage
+  jobs:
+  - name: Check dockerfile
+    type: tester
+    script:
+      $ref: https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/check_dockerfile.sh
+      $refType: text
+  - name: Check registry
+    type: builder
+    build_type: cr
+    # artifact_dir: ''
+    target:
+      region_id: ${REGISTRY_REGION_ID}
+      api_key: ${API_KEY}
+    namespace: ${REGISTRY_NAMESPACE}
+    image_name: ${APP_NAME}
+    script:
+      $ref: https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/check_registry.sh
+      $refType: text
+  - name: Build container image
+    type: builder
+    build_type: cr
+    artifact_dir: output
+    target:
+      region_id: ${REGISTRY_REGION_ID}
+      api_key: ${API_KEY}
+    namespace: ${REGISTRY_NAMESPACE}
+    image_name: ${APP_NAME}
+    script:
+      $ref: https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/build_image_buildkit.sh
+      $refType: text
+  - name: Check vulnerabilities
+    type: tester
+    test_type: vulnerabilityadvisor
+    use_image_from_build_input: true
+    fail_stage: false
+    target:
+      region_id: ${REGISTRY_REGION_ID}
+      api_key: ${API_KEY}
+    script:
+      $ref: https://raw.githubusercontent.com/open-toolchain/commons/master/scripts/check_vulnerabilities.sh
+      $refType: text
+- name: DEPLOY WITH RAZEE
+  inputs:
+  - type: job
+    stage: CONTAINERIZE
+    job: Build container image
+  triggers:
+  - type: stage
+  properties:
+  - name: buildprops
+    value: build.properties
+    type: file
+  - name: DEPLOYMENT_FILE
+    value: deployment.yml
+    type: text
+  - name: CLUSTER_REGION
+    value: ${PROD_REGION_ID}
+    type: text
+  - name: CLUSTER_NAMESPACE
+    value: ${PROD_CLUSTER_NAMESPACE}
+    type: text
+  - name: CONFIG_REPO_BRANCH
+    value: master
+    type: text
+  - name: CONFIG_REPO_NAME
+    value: ''
+    type: text
+  - name: CONFIG_REPO_URL
+    value: ''
+    type: text
+  jobs:
+  - name: Prepare Razee deploy
+    type: builder
+    artifact_dir: ''
+    build_type: shell
+    script:
+      $ref: prepare_deploy.sh
+      $refType: text
+  - name: Trigger Razee deploy
+    type: builder
+    artifact_dir: ''
+    build_type: shell
+    script:
+      $ref: trigger_config.sh
+      $refType: text
+- name: SETUP CLUSTER WITH RAZEE
+  inputs:
+  - type: job
+    stage: DEPLOY WITH RAZEE
+    job: Trigger Razee deploy
+  triggers:
+  - type: stage
+    enabled: false
+  properties:
+  - name: buildprops
+    value: build.properties
+    type: file
+  - name: IMAGE_NAME
+    value: ${APP_NAME}
+    type: text
+  - name: CLUSTER_REGION
+    value: ${PROD_REGION_ID}
+    type: text
+  - name: CLUSTER_NAMESPACE
+    value: ${PROD_CLUSTER_NAMESPACE}
+    type: text
+  - name: DEPLOYMENT_FILE
+    value: deployment.yml
+    type: text
+  - name: INSTALL_RAZEE
+    value: ${INSTALL_RAZEE}
+    type: text
+  - name: REMOTERESOURCE_FILE
+    value: remoteresource.yml
+    type: text
+  - name: APP_URL
+    value: undefined
+    type: text  
+  - name: CONFIG_REPO_BRANCH
+    value: master
+    type: text
+  jobs:
+  - name: Install Razee agent
+    type: deployer
+    target:
+      region_id: ${PROD_REGION_ID}
+      api_key: ${API_KEY}
+      kubernetes_cluster: ${PROD_CLUSTER_NAME}
+    script:
+      $ref: install_razee.sh
+      $refType: text
+  - name: Register app with Razee
+    type: deployer
+    target:
+      region_id: ${PROD_REGION_ID}
+      api_key: ${API_KEY}
+      kubernetes_cluster: ${PROD_CLUSTER_NAME}
+    script:
+      $ref: register_app.sh
+      $refType: text
