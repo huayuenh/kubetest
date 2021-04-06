@@ -9,6 +9,8 @@ echo "REGISTRY_URL=${REGISTRY_URL}"
 echo "REGISTRY_NAMESPACE=${REGISTRY_NAMESPACE}"
 echo "DEPLOYMENT_FILE=${DEPLOYMENT_FILE}"
 
+IMAGE=${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}
+echo "IMAGE ${IMAGE}"
 # # View build properties
 # if [ -f build.properties ]; then 
 #   echo "build.properties:"
@@ -50,7 +52,7 @@ fi
 DEPLOY_FILE="deploy.yml"
 yq read --doc $DEPLOYMENT_DOC_INDEX $DEPLOYMENT_FILE > "${DEPLOY_FILE}"
 
-echo "Updating ${DEPLOY_FILE} with image: ${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+echo "Updating ${DEPLOY_FILE} with image: ${IMAGE}"
 # if app repo ends in - and a 17 digit timestamp, append that suffix to all kube resources, else empty "" suffix
 RESOURCE_SUFFIX=$(echo "${IMAGE_NAME}" | sed -E "s/^.*(-[0-9]{17})$/\1/" | sed -E "/^-[0-9]{17}$/ ! s/.*//")
 if [ -z "$RESOURCE_SUFFIX" ]; then
@@ -62,7 +64,7 @@ else
 fi
 cp $DEPLOY_FILE "${DEPLOY_FILE}.bak"
 cat "${DEPLOY_FILE}.bak" \
-  | yq write - "spec.template.spec.containers[0].image" "${REGISTRY_URL}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}" \
+  | yq write - "spec.template.spec.containers[0].image" "${IMAGE}" \
   | yq write - "metadata.labels.app" "${DEPLOYMENT_NAME}" \
   | yq write - "metadata.name" "${DEPLOYMENT_NAME}" \
   | yq write - "spec.selector.matchLabels.app" "${DEPLOYMENT_NAME}" \
